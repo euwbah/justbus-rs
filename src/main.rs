@@ -1,4 +1,5 @@
-use actix::{Actor, Context, Handler, Message, Addr};
+use crate::JustBusError::ActorError;
+use actix::{Actor, Addr, Context, Handler, MailboxError, Message, AsyncContext};
 use actix_web::{
     web, App, Error as ActixErr, HttpRequest, HttpResponse, HttpServer, Responder, ResponseError,
 };
@@ -6,26 +7,23 @@ use futures::future::{ok as fut_ok, Either};
 use lru_time_cache::LruCache;
 use lta::bus::bus_arrival::ArrivalBusService;
 use lta::r#async::{bus::get_arrival, lta_client::LTAClient, prelude::*};
-use parking_lot::RwLock;
 use serde::Serialize;
 use std::fmt::Formatter;
 use std::{env::var, time::Duration};
 
 type LruCacheU32 = LruCache<u32, TimingResult>;
 
-enum LruMessages {
-    CheckLru(u32),
-    AddLru(u32, TimingResult)
-}
+struct CheckLru(u32);
+struct AddLru(u32, TimingResult);
 
 struct LruActor(LruCacheU32);
 
-impl Message for LruMessages::CheckLru {
-    type Result = Result<Option<Vec<ArrivalBusService>>, std::io::Error>;
+impl Message for CheckLru {
+    type Result = Result<Option<Vec<ArrivalBusService>>, JustBusError>;
 }
 
-impl Message for LruMessages::AddLru {
-    type Result = Result<(), std::io::Error>;
+impl Message for AddLru {
+    type Result = Result<TimingResult, JustBusError>;
 }
 
 impl Actor for LruActor {
@@ -40,23 +38,24 @@ impl Actor for LruActor {
     }
 }
 
-impl Handler<LruMessages::CheckLru> for LruActor {
-    type Result = Result<Option<Vec<ArrivalBusService>>, std::io::Error>;
+impl Handler<CheckLru> for LruActor {
+    type Result = Result<Option<Vec<ArrivalBusService>>, JustBusError>;
 
-    fn handle(&mut self, msg: LruMessages::CheckLru, ctx: &mut Self::Context) -> Self::Result {
+    fn handle(&mut self, msg: CheckLru, _: &mut Self::Context) -> Self::Result {
         println!("LruActor CheckLru !");
         let data = self.0.peek(&msg.0).map(|u| u.data.clone());
         Ok(data)
     }
 }
 
-impl Handler<LruMessages::AddLru> for LruActor {
-    type Result = Result<(), std::io::Error>;
+impl Handler<AddLru> for LruActor {
+    type Result = Result<TimingResult, JustBusError>;
 
-    fn handle(&mut self, msg: LruMessages::AddLru, ctx: &mut Self::Context) -> Self::Result {
-        println!("LruActor AddToLruPing!");
+    fn handle(&mut self, msg: AddLru, _: &mut Self::Context) -> Self::Result {
+        let data = msg.1.clone();
+        println!("LruActor AddToLruPing");
         self.0.insert(msg.0, msg.1);
-        Ok(())
+        Ok(data)
     }
 }
 
@@ -69,6 +68,19 @@ struct LruState {
 #[derive(Debug)]
 enum JustBusError {
     ClientError(lta::Error),
+    ActorError(String),
+}
+
+impl From<MailboxError> for JustBusError {
+    fn from(_: MailboxError) -> Self {
+        ActorError("MailBoxError".to_string())
+    }
+}
+
+impl From<()> for JustBusError {
+    fn from(_: ()) -> Self {
+        ActorError("MailBoxError".to_string())
+    }
 }
 
 impl std::fmt::Display for JustBusError {
@@ -119,59 +131,65 @@ impl LruState {
 
 fn get_timings(
     client: web::Data<LTAClient>,
-    lru_actor: web::Data<Addr<LruActor>>
+    lru_actor: web::Data<Addr<LruActor>>,
 ) -> impl Future<Item = HttpResponse, Error = JustBusError> {
+    lru_actor
+        .send(CheckLru(83139))
+        .from_err()
+        .and_then(move |res| match res {
+            Ok(data) => match data {
+                Some(vec) => Either::A(fut_ok(
+                    HttpResponse::Ok().json(TimingResult::new(83139, vec.clone())),
+                )),
+                None => {
+                    println!("Data from LTA on T: {:?}", std::thread::current().id());
+                    Either::B(
+                        get_arrival(&client, 83139, None)
+                            .map_err(|e| JustBusError::ClientError(e))
+                            .and_then(move |r| {
+                                let data = r.services.clone();
+                                lru_actor
+                                    .send(AddLru(83139, TimingResult::new(83139, data)))
+                                    .from_err()
+                            })
+                            .map(|f| {
+                                match f {
+                                    Ok(t) => HttpResponse::Ok().json(t),
+                                    Err(e) => {
+                                        println!("{:?}", e);
+                                        HttpResponse::InternalServerError().finish()
+                                    }
+                                }
 
-    let msg_res_fut = lru_actor.send(LruMessages::CheckLru(83139));
-
-
-
-    match msg_res {
-        Some(data) => {
-            //            println!("Taking from LRU");
-            Either::A(fut_ok(
-                HttpResponse::Ok().json(TimingResult::new(83139, data.clone().data)),
-            ))
-        }
-        None => {
-            println!(
-                "Fresh data from LTA on Thread: {:?}",
-                std::thread::current().id()
-            );
-            Either::B(
-                get_arrival(&client, 83139, None)
-                    .then(move |r| {
-                        r.map(|r| {
-                            let data = r.services.clone();
-                            let mut lru_w = lru_state_2.write();
-                            lru_w.lru.insert(83139, TimingResult::new(83139, data));
-                            r
-                        })
-                    })
-                    .map(|f| HttpResponse::Ok().json(TimingResult::new(83139, f.services)))
-                    .map_err(|e| JustBusError::ClientError(e)),
-            )
-        }
-    }
+                            }),
+                    )
+                }
+            },
+            Err(e) => Either::A(fut_ok(HttpResponse::InternalServerError().finish())),
+        })
 }
 
 fn main() {
     println!("Starting server @ 127.0.0.1:8080");
+
     let api_key = var("API_KEY").unwrap();
+    let lta_client = LTAClient::with_api_key(api_key);
     let ttl = Duration::from_millis(1000 * 15);
+
+    let sys = actix::System::new("LRU");
     let lru_cache = LruCacheU32::with_expiry_duration(ttl);
     let lru_actor = LruActor(lru_cache).start();
 
     HttpServer::new(move || {
-        let api_key = var("API_KEY").unwrap();
-        let lta_client = LTAClient::with_api_key(api_key);
         App::new()
             .route("/api/v1/timings", web::get().to_async(get_timings))
-            .data(lta_client)
-            .data(lru_actor)
+            .data(lta_client.clone())
+            .data(lru_actor.clone())
     })
     .bind("127.0.0.1:8080")
     .unwrap()
     .run()
     .unwrap();
+
+    let _ = sys.run();
 }

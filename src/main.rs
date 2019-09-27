@@ -1,5 +1,5 @@
 use crate::JustBusError::ActorError;
-use actix::{Actor, Addr, Context, Handler, MailboxError, Message, AsyncContext};
+use actix::{Actor, Addr, Context, Handler, MailboxError, Message};
 use actix_web::{
     web, App, Error as ActixErr, HttpRequest, HttpResponse, HttpServer, Responder, ResponseError,
 };
@@ -29,11 +29,11 @@ impl Message for AddLru {
 impl Actor for LruActor {
     type Context = Context<Self>;
 
-    fn started(&mut self, ctx: &mut Self::Context) {
+    fn started(&mut self, _: &mut Self::Context) {
         println!("LruActor started, spawning LruCache!");
     }
 
-    fn stopped(&mut self, ctx: &mut Self::Context) {
+    fn stopped(&mut self, _: &mut Self::Context) {
         println!("LruActor stopped!");
     }
 }
@@ -57,12 +57,6 @@ impl Handler<AddLru> for LruActor {
         self.0.insert(msg.0, msg.1);
         Ok(data)
     }
-}
-
-#[derive(Clone)]
-struct LruState {
-    pub lru: LruCache<u32, TimingResult>,
-    pub client: LTAClient,
 }
 
 #[derive(Debug)]
@@ -123,12 +117,6 @@ impl Responder for TimingResult {
     }
 }
 
-impl LruState {
-    pub fn new(lru: LruCache<u32, TimingResult>, client: LTAClient) -> Self {
-        LruState { lru, client }
-    }
-}
-
 fn get_timings(
     client: web::Data<LTAClient>,
     lru_actor: web::Data<Addr<LruActor>>,
@@ -165,7 +153,7 @@ fn get_timings(
                     )
                 }
             },
-            Err(e) => Either::A(fut_ok(HttpResponse::InternalServerError().finish())),
+            Err(_) => Either::A(fut_ok(HttpResponse::InternalServerError().finish())),
         })
 }
 

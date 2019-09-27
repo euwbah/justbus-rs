@@ -17,7 +17,9 @@ parking_lot = "0.9.0"
 actix = "0.8.3"
 
 [profile.dev]
-opt-level = 0
+opt-level = 3
+codegen-units = 1
+lto = true
 
 [profile.release]
 opt-level = 3

@@ -1,3 +1,5 @@
+#[macro_use]
+extern crate lazy_static;
 extern crate jemallocator;
 use actix_web::{
     web, App, Error as ActixErr, HttpRequest, HttpResponse, HttpServer, Responder, ResponseError,
@@ -10,6 +12,7 @@ use parking_lot::RwLock;
 use serde::Serialize;
 use std::fmt::Formatter;
 use std::{env::var, time::Duration};
+
 
 #[global_allocator]
 static ALLOC: jemallocator::Jemalloc = jemallocator::Jemalloc;
@@ -61,17 +64,13 @@ impl Responder for TimingResult {
 
 fn get_timings(
     path: web::Path<u32>,
-    lru: web::Data<RwLock<LruCacheU32>>,
-    client: web::Data<LTAClient>,
 ) -> impl Future<Item = HttpResponse, Error = JustBusError> {
     let inner_path = path.into_inner();
-    let lru_state_2 = lru.clone();
-    let inner = lru.read();
+    let inner = LRU.read();
     let in_lru = inner.peek(&inner_path);
 
     match in_lru {
         Some(data) => {
-            //            println!("Taking from LRU");
             Either::A(fut_ok(
                 HttpResponse::Ok().json(TimingResult::new(inner_path, data.clone().data)),
             ))
@@ -79,15 +78,15 @@ fn get_timings(
         None => {
             println!(
                 "Fresh data from LTA. client_ptr: {:p}, cache_ptr: {:p}",
-                &client, &lru
+                &CLIENT, &LRU
             );
             Either::B(
-                get_arrival(&client, inner_path, None)
+                get_arrival(&CLIENT, inner_path, None)
                     .then(move |r| {
                         r.map(|r| {
                             let bus_stop = inner_path;
                             let data = r.services.clone();
-                            let mut lru_w = lru_state_2.write();
+                            let mut lru_w = LRU.write();
                             lru_w.insert(bus_stop, TimingResult::new(bus_stop, data));
                             (r, bus_stop)
                         })
@@ -101,21 +100,27 @@ fn get_timings(
 
 type LruCacheU32 = LruCache<u32, TimingResult>;
 
+
+lazy_static! {
+    static ref CLIENT: LTAClient = {
+        let api_key = var("API_KEY").unwrap();
+        LTAClient::with_api_key(api_key)
+    };
+
+    static ref LRU: RwLock<LruCacheU32> = {
+        let ttl = Duration::from_millis(1000 * 60);
+        RwLock::new(LruCacheU32::with_expiry_duration(ttl))
+    };
+}
+
 fn main() {
     println!("Starting server @ 127.0.0.1:8080");
-    let api_key = var("API_KEY").unwrap();
-    let ttl = Duration::from_millis(1000 * 60);
-    let client = web::Data::new(LTAClient::with_api_key(api_key));
-    let lru_cache = web::Data::new(RwLock::new(LruCacheU32::with_expiry_duration(ttl)));
-
     HttpServer::new(move || {
         App::new()
             .route(
                 "/api/v1/timings/{bus_stop}",
                 web::get().to_async(get_timings),
             )
-            .register_data(lru_cache.clone())
-            .register_data(client.clone())
     })
     .bind("127.0.0.1:8080")
     .unwrap()

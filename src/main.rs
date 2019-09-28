@@ -13,7 +13,6 @@ use serde::Serialize;
 use std::fmt::Formatter;
 use std::{env::var, time::Duration};
 
-
 #[global_allocator]
 static ALLOC: jemallocator::Jemalloc = jemallocator::Jemalloc;
 
@@ -62,19 +61,15 @@ impl Responder for TimingResult {
     }
 }
 
-fn get_timings(
-    path: web::Path<u32>,
-) -> impl Future<Item = HttpResponse, Error = JustBusError> {
+fn get_timings(path: web::Path<u32>) -> impl Future<Item = HttpResponse, Error = JustBusError> {
     let inner_path = path.into_inner();
     let inner = LRU.read();
     let in_lru = inner.peek(&inner_path);
 
     match in_lru {
-        Some(data) => {
-            Either::A(fut_ok(
-                HttpResponse::Ok().json(TimingResult::new(inner_path, data.clone().data)),
-            ))
-        }
+        Some(data) => Either::A(fut_ok(
+            HttpResponse::Ok().json(TimingResult::new(inner_path, data.clone().data)),
+        )),
         None => {
             println!(
                 "Fresh data from LTA. client_ptr: {:p}, cache_ptr: {:p}",
@@ -88,11 +83,11 @@ fn get_timings(
                             let data = r.services.clone();
                             let mut lru_w = LRU.write();
                             lru_w.insert(bus_stop, TimingResult::new(bus_stop, data));
-                            (r, bus_stop)
+                            r
                         })
                     })
-                    .map(|f| HttpResponse::Ok().json(TimingResult::new(f.1, f.0.services)))
-                    .map_err(|e| JustBusError::ClientError(e)),
+                    .map(|f| HttpResponse::Ok().json(TimingResult::new(f.bus_stop_code, f.services)))
+                    .map_err(JustBusError::ClientError),
             )
         }
     }
@@ -100,13 +95,11 @@ fn get_timings(
 
 type LruCacheU32 = LruCache<u32, TimingResult>;
 
-
 lazy_static! {
     static ref CLIENT: LTAClient = {
         let api_key = var("API_KEY").unwrap();
         LTAClient::with_api_key(api_key)
     };
-
     static ref LRU: RwLock<LruCacheU32> = {
         let ttl = Duration::from_millis(1000 * 60);
         RwLock::new(LruCacheU32::with_expiry_duration(ttl))
@@ -116,11 +109,10 @@ lazy_static! {
 fn main() {
     println!("Starting server @ 127.0.0.1:8080");
     HttpServer::new(move || {
-        App::new()
-            .route(
-                "/api/v1/timings/{bus_stop}",
-                web::get().to_async(get_timings),
-            )
+        App::new().route(
+            "/api/v1/timings/{bus_stop}",
+            web::get().to_async(get_timings),
+        )
     })
     .bind("127.0.0.1:8080")
     .unwrap()

@@ -42,7 +42,7 @@ impl Handler<CheckLru> for LruActor {
     type Result = Result<Option<Vec<ArrivalBusService>>, JustBusError>;
 
     fn handle(&mut self, msg: CheckLru, _: &mut Self::Context) -> Self::Result {
-        println!("LruActor CheckLru !");
+        println!("LruActor CheckLru!");
         let data = self.0.peek(&msg.0).map(|u| u.data.clone());
         Ok(data)
     }
@@ -118,40 +118,36 @@ impl Responder for TimingResult {
 }
 
 fn get_timings(
+    path: web::Path<u32>,
     client: web::Data<LTAClient>,
     lru_actor: web::Data<Addr<LruActor>>,
 ) -> impl Future<Item = HttpResponse, Error = JustBusError> {
+    let bus_stop = path.into_inner();
     lru_actor
-        .send(CheckLru(83139))
+        .send(CheckLru(bus_stop))
         .from_err()
         .and_then(move |res| match res {
             Ok(data) => match data {
                 Some(vec) => Either::A(fut_ok(
-                    HttpResponse::Ok().json(TimingResult::new(83139, vec.clone())),
+                    HttpResponse::Ok().json(TimingResult::new(bus_stop, vec.clone())),
                 )),
-                None => {
-                    println!("Data from LTA on T: {:?}", std::thread::current().id());
-                    Either::B(
-                        get_arrival(&client, 83139, None)
-                            .map_err(|e| JustBusError::ClientError(e))
-                            .and_then(move |r| {
-                                let data = r.services.clone();
-                                lru_actor
-                                    .send(AddLru(83139, TimingResult::new(83139, data)))
-                                    .from_err()
-                            })
-                            .map(|f| {
-                                match f {
-                                    Ok(t) => HttpResponse::Ok().json(t),
-                                    Err(e) => {
-                                        println!("{:?}", e);
-                                        HttpResponse::InternalServerError().finish()
-                                    }
-                                }
-
-                            }),
-                    )
-                }
+                None => Either::B(
+                    get_arrival(&client, bus_stop, None)
+                        .map_err(JustBusError::ClientError)
+                        .and_then(move |r| {
+                            let data = r.services.clone();
+                            lru_actor
+                                .send(AddLru(bus_stop, TimingResult::new(bus_stop, data)))
+                                .from_err()
+                        })
+                        .map(|f| match f {
+                            Ok(t) => HttpResponse::Ok().json(t),
+                            Err(e) => {
+                                println!("{:?}", e);
+                                HttpResponse::InternalServerError().finish()
+                            }
+                        }),
+                ),
             },
             Err(_) => Either::A(fut_ok(HttpResponse::InternalServerError().finish())),
         })
@@ -159,20 +155,18 @@ fn get_timings(
 
 fn main() {
     println!("Starting server @ 127.0.0.1:8080");
-
     let api_key = var("API_KEY").unwrap();
     let lta_client = LTAClient::with_api_key(api_key);
-    let ttl = Duration::from_millis(1000 * 15);
-
+    let ttl = Duration::from_millis(1000 * 60);
     let sys = actix::System::new("LRU");
-    let lru_cache = LruCacheU32::with_expiry_duration(ttl);
-    let lru_actor = LruActor(lru_cache).start();
 
     HttpServer::new(move || {
+        let lru_cache = LruCacheU32::with_expiry_duration(ttl);
+        let lru_actor = LruActor(lru_cache).start();
         App::new()
-            .route("/api/v1/timings", web::get().to_async(get_timings))
+            .route("/api/v1/timings/{bus_stop}", web::get().to_async(get_timings))
             .data(lta_client.clone())
-            .data(lru_actor.clone())
+            .data(lru_actor)
     })
     .bind("127.0.0.1:8080")
     .unwrap()
